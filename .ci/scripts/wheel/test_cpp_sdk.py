@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 # Registry entry points. A second definer of any of these means a second
@@ -59,6 +60,10 @@ _XNNPACK_SYMBOLS = (
     "executorch::backends::xnnpack::XnnpackBackendOptions::workspace_manager",
 )
 
+# A representative symbol from the CUDA delegate's shim layer. The delegate's own
+# methods are weak symbols, so this checks a strong one instead.
+_CUDA_SYMBOLS = ("executorch::backends::cuda::clearCurrentCUDAStream",)
+
 # `nm -DC` prints "<hexaddr> <kind> <name>" for a definition and
 # "                 U <name>" for an undefined reference.
 _DEFINED = re.compile(r"^[0-9a-fA-F]+\s+(?P<kind>[A-Za-z])\s+(?P<name>.+)$")
@@ -67,6 +72,7 @@ _DEFINED = re.compile(r"^[0-9a-fA-F]+\s+(?P<kind>[A-Za-z])\s+(?P<name>.+)$")
 _OWNING_KINDS = frozenset("TtBbDdGgSsRrWV")
 
 _CONSUMER_SOURCE = """\
+#include <executorch/extension/module/module.h>
 #include <executorch/runtime/backend/interface.h>
 #include <executorch/runtime/platform/runtime.h>
 
@@ -74,9 +80,16 @@ _CONSUMER_SOURCE = """\
 
 int main() {
   executorch::runtime::runtime_init();
+  // Printed rather than asserted on purpose. This consumer links only the
+  // runtime, exactly as the documented two-line example does, and the runtime
+  // alone registers no backend. Requiring a nonzero count here would be
+  // asserting that the runtime does something it is not supposed to do.
   std::printf(
       "registered backends: %zu\\n",
       (size_t)executorch::runtime::get_num_registered_backends());
+  // Compile against the Module header too. It is shipped and advertised as the
+  // way to load a program, so a consumer must be able to include it.
+  (void)sizeof(executorch::extension::Module);
   return 0;
 }
 """
@@ -155,16 +168,227 @@ def _report_definers(symbols, what: str, limit: int) -> None:
         )
 
 
-def _assert_single_definer(symbols, what: str) -> None:
-    """Exactly one shipped library may define each of `symbols`."""
+def report_wheel_composition() -> None:
+    """Print what the wheel ships and what each library needs.
+
+    Not an assertion. A size jump or an unexpected external dependency is the
+    first visible sign that a component got statically duplicated again, so the
+    numbers are worth having in the log of every run.
+    """
+    package_dir = _installed_package_dir()
+    libraries = _shipped_shared_objects(package_dir)
+
+    print("shipped libraries:")
+    total = 0
+    for library in sorted(libraries, key=lambda path: path.name):
+        size = library.stat().st_size
+        total += size
+        print(f"  {size / 1024:9.1f} KiB  {library.relative_to(package_dir)}")
+    print(f"  {total / 1024:9.1f} KiB  total")
+
+    if shutil.which("readelf") is None:
+        return
+    # Anything the libraries need that the wheel does not itself ship has to be
+    # present on the user's machine, so it belongs in the report. Compare against
+    # the shipped file names rather than guessing from name prefixes.
+    shipped = {library.name for library in libraries}
+    external = set()
+    for library in libraries:
+        dynamic = subprocess.run(
+            ["readelf", "-d", str(library)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        for line in dynamic.splitlines():
+            if "(NEEDED)" not in line or "[" not in line:
+                continue
+            name = line.split("[", 1)[1].rstrip("]").strip()
+            if name not in shipped:
+                external.add(name)
+    if external:
+        print("external dependencies expected from the environment:")
+        for name in sorted(external):
+            print(f"  {name}")
+
+
+def test_shipped_libraries_load() -> None:
+    """Every shipped library must depend only on things that exist.
+
+    The symbol checks prove each component is defined exactly once, but a library
+    can still be unloadable if it needs something nothing provides, which is a
+    packaging bug rather than a duplication bug.
+
+    A dependency the wheel ships elsewhere is fine even when `ldd` cannot resolve
+    it: some extensions are loaded after `import torch` has already brought their
+    dependencies into the process, so they intentionally carry no path to them.
+    Only a name nothing in the wheel provides is a real problem.
+    """
+    if shutil.which("ldd") is None:
+        print("- ldd not available, skipping the load check")
+        return
+
+    package_dir = _installed_package_dir()
+    libraries = _shipped_shared_objects(package_dir)
+    shipped = {library.name for library in libraries}
+
+    # A dependency is only excusable when the wheel ships it AND the loader can
+    # actually reach it from the library that needs it. Loaded-later extensions
+    # such as the Torch libraries are the real exception: they resolve once the
+    # Python package that owns them is imported. Anything the wheel itself ships
+    # must resolve here, because a RUNPATH applies to the library carrying it and
+    # is not inherited on behalf of a dependency's own dependencies.
+    broken = {}
+    unreachable = {}
+    unresolved = {}
+    for library in libraries:
+        resolved = subprocess.run(
+            # -r resolves data and function symbols too, not just the NEEDED
+            # entries. A SHARED link does not error on undefined symbols, so
+            # without this an under-linked library passes here and fails at first
+            # use instead.
+            ["ldd", "-r", str(library)],
+            capture_output=True,
+            text=True,
+            check=False,
+            # Any LD_LIBRARY_PATH in the build environment would paper over a
+            # RUNPATH the shipped library is actually missing.
+            env={
+                key: value
+                for key, value in os.environ.items()
+                if key != "LD_LIBRARY_PATH"
+            },
+        )
+        # ldd reports missing libraries on stdout but undefined symbols on stderr,
+        # so both streams matter.
+        combined = resolved.stdout + resolved.stderr
+        missing = [
+            line.split("=>")[0].strip()
+            for line in combined.splitlines()
+            if "not found" in line
+        ]
+        undefined = [
+            line.strip() for line in combined.splitlines() if "undefined symbol" in line
+        ]
+        if undefined:
+            unresolved[str(library.relative_to(package_dir))] = undefined[:5]
+        absent = [name for name in missing if name not in shipped]
+        present_but_unreachable = [name for name in missing if name in shipped]
+        if absent:
+            broken[str(library.relative_to(package_dir))] = absent
+        if present_but_unreachable:
+            unreachable[str(library.relative_to(package_dir))] = present_but_unreachable
+
+    assert not broken, (
+        "shipped libraries need dependencies that nothing provides, so they will "
+        f"fail to load: {broken}"
+    )
+    assert not unreachable, (
+        "shipped libraries need dependencies the wheel ships but the loader "
+        "cannot reach from them, which usually means a missing RUNPATH entry: "
+        f"{unreachable}"
+    )
+    assert not unresolved, (
+        "shipped libraries reference symbols nothing provides, so they will fail "
+        f"at first use rather than at load: {unresolved}"
+    )
+    print("✓ every shipped library resolves every dependency it needs")
+
+
+def test_shipped_libraries_resolve_without_build_tree() -> None:
+    """A shipped library must resolve using only its relative runtime paths.
+
+    Packaging copies binaries out of the build directory, so they still carry the
+    absolute paths they were linked with. On the machine that produced the wheel
+    those paths exist, which means a library whose relative path is wrong can still
+    resolve and look correct. Anywhere else it would fail.
+
+    Copy each library and its wheel-provided dependencies into a fresh tree that
+    mirrors the wheel layout, drop every absolute runtime path, and check what is
+    left is enough.
+    """
+    if shutil.which("ldd") is None or shutil.which("patchelf") is None:
+        print("- ldd or patchelf unavailable, skipping the relocated load check")
+        return
+
+    package_dir = _installed_package_dir()
+    libraries = _shipped_shared_objects(package_dir)
+    environment = {
+        key: value for key, value in os.environ.items() if key != "LD_LIBRARY_PATH"
+    }
+
+    with tempfile.TemporaryDirectory() as work_dir:
+        root = Path(work_dir) / package_dir.name
+        # Mirror the layout so a relative path such as $ORIGIN/../../lib still
+        # points where it would in a real install.
+        for library in libraries:
+            target = root / library.relative_to(package_dir)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(library, target)
+
+        broken = {}
+        for library in libraries:
+            target = root / library.relative_to(package_dir)
+            current = subprocess.run(
+                ["patchelf", "--print-rpath", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout.strip()
+            relative = [
+                entry for entry in current.split(":") if entry.startswith("$ORIGIN")
+            ]
+            subprocess.run(
+                ["patchelf", "--set-rpath", ":".join(relative), str(target)],
+                check=False,
+            )
+            resolved = subprocess.run(
+                ["ldd", str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+                env=environment,
+            ).stdout
+            shipped = {item.name for item in libraries}
+            missing = [
+                line.split("=>")[0].strip()
+                for line in resolved.splitlines()
+                if "not found" in line and line.split("=>")[0].strip() in shipped
+            ]
+            if missing:
+                broken[str(library.relative_to(package_dir))] = missing
+
+        assert not broken, (
+            "shipped libraries only resolve their wheel-provided dependencies "
+            "through absolute build paths, so they would fail on any other "
+            f"machine: {broken}"
+        )
+    print("✓ every shipped library resolves without the build tree")
+
+
+def _assert_single_definer(symbols, what: str, optional: bool = False) -> None:
+    """Exactly one shipped library may define each of `symbols`.
+
+    `optional` allows a component that is only present in some wheel flavors,
+    such as an accelerator delegate, to be absent without failing.
+    """
     assert shutil.which("nm") is not None, "nm is required to inspect the wheel"
 
     package_dir = _installed_package_dir()
     libraries = _shipped_shared_objects(package_dir)
     assert libraries, f"no shared libraries found under {package_dir}"
 
-    for symbol in symbols:
-        definers = [lib for lib in libraries if _defines_symbol(lib, symbol)]
+    # Resolve every symbol first, so a component that is only half present is
+    # reported rather than being mistaken for one that is absent entirely.
+    found = {
+        symbol: [lib for lib in libraries if _defines_symbol(lib, symbol)]
+        for symbol in symbols
+    }
+    if optional and not any(found.values()):
+        print(f"- no {what} in this wheel, skipping")
+        return
+
+    for symbol, definers in found.items():
         pretty = [str(lib.relative_to(package_dir)) for lib in definers]
         assert len(definers) == 1, (
             f"expected exactly one library to define {symbol}, found "
@@ -198,6 +422,20 @@ def test_single_kernel_registration() -> None:
 def test_single_xnnpack_delegate() -> None:
     """Exactly one shipped library may define the XNNPACK delegate."""
     _assert_single_definer(_XNNPACK_SYMBOLS, "XNNPACK delegate")
+
+
+def test_single_cuda_delegate() -> None:
+    """Exactly one shipped library may define the CUDA delegate, if present.
+
+    Presence is decided from the shipped library file, not from whether the symbol
+    resolves. Inferring absence from a missing symbol means a rename on a CUDA
+    wheel would skip the check instead of failing it.
+    """
+    package_dir = _installed_package_dir()
+    if not list(package_dir.rglob("libexecutorch_cuda_backend.so*")):
+        print("- no CUDA delegate in this wheel, skipping")
+        return
+    _assert_single_definer(_CUDA_SYMBOLS, "CUDA delegate")
 
 
 def test_cpp_consumer(work_dir: Path) -> None:
@@ -298,8 +536,12 @@ def _assert_runs_relocated(consumer, package_dir, work_dir, environment) -> None
 
 
 def run_tests(work_dir: Path) -> None:
+    report_wheel_composition()
+    test_shipped_libraries_load()
+    test_shipped_libraries_resolve_without_build_tree()
     test_single_backend_registry()
     test_single_threadpool()
     test_single_kernel_registration()
     test_single_xnnpack_delegate()
+    test_single_cuda_delegate()
     test_cpp_consumer(work_dir)
