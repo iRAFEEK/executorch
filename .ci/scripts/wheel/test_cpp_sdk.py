@@ -40,6 +40,19 @@ _REGISTRY_SYMBOLS = (
 # oversubscribes the CPU because each pool sizes itself to all cores.
 _THREADPOOL_SYMBOLS = ("executorch::extension::threadpool::get_threadpool",)
 
+# A representative operator from the merged CPU kernels. A second definer means
+# the operators are registered twice, which aborts at startup.
+_KERNEL_SYMBOLS = ("torch::executor::native::abs_out",)
+
+# The registry entry points, kept separate from the kernel implementations above.
+# A library that carries its own copy of these has its own registration code, which
+# is what this split is meant to prevent: one owner of the operator table. Checking
+# only a kernel implementation would miss that entirely.
+_KERNEL_REGISTRY_SYMBOLS = (
+    "executorch::runtime::register_kernels",
+    "executorch::runtime::get_registered_kernels",
+)
+
 # `nm -DC` prints "<hexaddr> <kind> <name>" for a definition and
 # "                 U <name>" for an undefined reference.
 _DEFINED = re.compile(r"^[0-9a-fA-F]+\s+(?P<kind>[A-Za-z])\s+(?P<name>.+)$")
@@ -110,6 +123,32 @@ def _defines_symbol(library: Path, symbol: str) -> bool:
     return False
 
 
+def _report_definers(symbols, what: str, limit: int) -> None:
+    """Print which shipped libraries define each symbol and hold a ceiling.
+
+    Used where the desired invariant is one owner but the wheel does not reach it
+    yet for reasons outside this change. Printing alone would let a regression
+    from a few definers to many stay green, so the count is also capped at the
+    number that exists today. The cap is meant to be lowered, never raised.
+    """
+    package_dir = _installed_package_dir()
+    libraries = _shipped_shared_objects(package_dir)
+    for symbol in symbols:
+        definers = [
+            str(library.relative_to(package_dir))
+            for library in libraries
+            if _defines_symbol(library, symbol)
+        ]
+        print(f"- {what}: {symbol.split('::')[-1]} defined by {len(definers)}")
+        for definer in definers:
+            print(f"    {definer}")
+        assert len(definers) <= limit, (
+            f"{what}: {symbol} is defined by {len(definers)} shipped libraries, "
+            f"more than the {limit} that existed when this check was added, so a "
+            f"new duplicate crept in: {definers}"
+        )
+
+
 def _assert_single_definer(symbols, what: str) -> None:
     """Exactly one shipped library may define each of `symbols`."""
     assert shutil.which("nm") is not None, "nm is required to inspect the wheel"
@@ -137,6 +176,17 @@ def test_single_backend_registry() -> None:
 def test_single_threadpool() -> None:
     """Exactly one shipped library may define the thread pool accessor."""
     _assert_single_definer(_THREADPOOL_SYMBOLS, "thread pool")
+
+
+def test_single_kernel_registration() -> None:
+    """Exactly one shipped library may define the merged CPU kernels."""
+    _assert_single_definer(_KERNEL_SYMBOLS, "set of CPU kernels")
+    # Ownership of the operator table, not just of a kernel implementation. This is
+    # reported rather than asserted because two extension modules still link the
+    # static core and carry their own copy, which predates this split: a released
+    # wheel has five definers where this one has three. Asserting here would fail
+    # on those pre-existing copies rather than on anything this change introduced.
+    _report_definers(_KERNEL_REGISTRY_SYMBOLS, "operator registry", limit=2)
 
 
 def test_cpp_consumer(work_dir: Path) -> None:
@@ -239,4 +289,5 @@ def _assert_runs_relocated(consumer, package_dir, work_dir, environment) -> None
 def run_tests(work_dir: Path) -> None:
     test_single_backend_registry()
     test_single_threadpool()
+    test_single_kernel_registration()
     test_cpp_consumer(work_dir)
