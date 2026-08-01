@@ -53,6 +53,12 @@ _KERNEL_REGISTRY_SYMBOLS = (
     "executorch::runtime::get_registered_kernels",
 )
 
+# A representative symbol from the XNNPACK delegate. A second definer means the
+# process carries two copies of the delegate.
+_XNNPACK_SYMBOLS = (
+    "executorch::backends::xnnpack::XnnpackBackendOptions::workspace_manager",
+)
+
 # `nm -DC` prints "<hexaddr> <kind> <name>" for a definition and
 # "                 U <name>" for an undefined reference.
 _DEFINED = re.compile(r"^[0-9a-fA-F]+\s+(?P<kind>[A-Za-z])\s+(?P<name>.+)$")
@@ -189,6 +195,11 @@ def test_single_kernel_registration() -> None:
     _report_definers(_KERNEL_REGISTRY_SYMBOLS, "operator registry", limit=2)
 
 
+def test_single_xnnpack_delegate() -> None:
+    """Exactly one shipped library may define the XNNPACK delegate."""
+    _assert_single_definer(_XNNPACK_SYMBOLS, "XNNPACK delegate")
+
+
 def test_cpp_consumer(work_dir: Path) -> None:
     """A standalone C++ app builds and runs against the installed wheel."""
     assert shutil.which("cmake") is not None, "cmake is required to build a consumer"
@@ -290,4 +301,5 @@ def run_tests(work_dir: Path) -> None:
     test_single_backend_registry()
     test_single_threadpool()
     test_single_kernel_registration()
+    test_single_xnnpack_delegate()
     test_cpp_consumer(work_dir)
