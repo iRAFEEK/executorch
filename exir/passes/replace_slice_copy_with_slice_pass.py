@@ -85,8 +85,21 @@ def _slice_start_as_int(start: Any) -> int:
 
 def _compute_slice_byte_offset(base: TensorSpec, dim: int, start: Any) -> int:
     start_int = _slice_start_as_int(start)
+    if start_int < 0:
+        raise ValueError("memory.slice does not support negative slice starts.")
     elem_size = torch._utils._element_size(base.dtype)
     return start_int * base.stride[dim] * elem_size
+
+
+def _has_default_dim_order(spec: TensorSpec) -> bool:
+    """Whether ``spec`` has the standard contiguous dimension ordering.
+
+    ``_SliceSpec`` computes a contiguous output stride.  That is only a valid
+    alias for a dim-0 slice when the base itself has the default dim order.
+    """
+    return spec.dim_order == dim_order_from_stride(
+        contiguous_stride_from_shape(torch.Size(spec.shape))
+    )
 
 
 class _SliceSpec(TensorSpec):
@@ -237,6 +250,7 @@ class ReplaceSliceCopyWithSlicePass(PassBase):
                         not isinstance(base, torch.fx.Node)
                         or "spec" not in base.meta
                         or not base.meta["spec"].is_static_shape_tensor
+                        or not _has_default_dim_order(base.meta["spec"])
                     ):
                         # Specs are populated by the lowering pipeline before this
                         # pass.  Skip bare FX graphs so the pass remains safe to use
@@ -244,6 +258,11 @@ class ReplaceSliceCopyWithSlicePass(PassBase):
                         continue
                     dim = node.args[1] if len(node.args) > 1 else 0
                     start = node.args[2] if len(node.args) > 2 else None
+                    if _slice_start_as_int(start) < 0:
+                        # Negative starts are relative to the end of the
+                        # dimension.  They cannot be expressed as a static
+                        # offset without normalizing against the base shape.
+                        continue
                     node.target = _SLICE_OP
                     shape = node.meta["val"].shape
                     node.meta["spec"] = _SliceSpec(

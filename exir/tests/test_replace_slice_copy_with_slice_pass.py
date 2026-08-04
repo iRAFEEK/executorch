@@ -9,13 +9,19 @@
 import unittest
 
 import torch
-from executorch.exir import to_edge
+from executorch.exir import memory, to_edge
 from executorch.exir.passes.replace_slice_copy_with_slice_pass import (
+    _compute_slice_byte_offset,
     _is_slice_copy,
     is_contiguous_slice_copy,
     ReplaceSliceCopyWithSlicePass,
 )
+from executorch.exir.tensor import TensorSpec
+from executorch.extension.pybindings.portable_lib import (
+    _load_for_executorch_from_buffer,
+)
 from torch.export import export
+from torch.testing import assert_close
 
 
 class TestReplaceSliceCopyWithSlicePass(unittest.TestCase):
@@ -57,20 +63,80 @@ class TestReplaceSliceCopyWithSlicePass(unittest.TestCase):
         ]
         self.assertEqual(len(eligible), 1)
 
-    def test_pass_is_safe_noop_until_offset_aliasing_lands(self) -> None:
-        """The pass must run cleanly and not mutate the graph while the
-        offset-aliasing rewrite is still gated (see #10917)."""
+    def _annotate_input_spec(self, gm: torch.fx.GraphModule) -> None:
+        input_node = next(n for n in gm.graph.nodes if n.op == "placeholder")
+        input_node.meta["spec"] = TensorSpec.from_tensor(input_node.meta["val"])
+
+    def test_pass_replaces_annotated_contiguous_slice(self) -> None:
+        """A statically annotated dim-0 slice becomes a memory alias."""
 
         class M(torch.nn.Module):
             def forward(self, x):
                 return x[0:2] + 1.0
 
         gm = self._edge_graph_module(M(), (torch.randn(4, 8),))
-        before = gm.code
+        self._annotate_input_spec(gm)
         result = ReplaceSliceCopyWithSlicePass()(gm)
         self.assertIsNotNone(result)
+        self.assertTrue(result.modified)
+        self.assertEqual(
+            len(
+                [
+                    n
+                    for n in result.graph_module.graph.nodes
+                    if n.op == "call_function" and n.target == memory.slice
+                ]
+            ),
+            1,
+        )
+
+    def test_pass_skips_nondefault_base_dim_order(self) -> None:
+        """Avoid aliases that would reinterpret a non-contiguous base layout."""
+
+        class M(torch.nn.Module):
+            def forward(self, x):
+                return x[0:2] + 1.0
+
+        gm = self._edge_graph_module(M(), (torch.randn(4, 8),))
+        self._annotate_input_spec(gm)
+        input_node = next(n for n in gm.graph.nodes if n.op == "placeholder")
+        input_node.meta["spec"].dim_order = (1, 0)
+
+        result = ReplaceSliceCopyWithSlicePass()(gm)
         self.assertFalse(result.modified)
-        self.assertEqual(before, result.graph_module.code)
+
+    def test_pass_skips_negative_start(self) -> None:
+        """Negative starts need shape-dependent normalization, so keep copying."""
+
+        class M(torch.nn.Module):
+            def forward(self, x):
+                return x[-2:] + 1.0
+
+        gm = self._edge_graph_module(M(), (torch.randn(4, 8),))
+        self._annotate_input_spec(gm)
+
+        result = ReplaceSliceCopyWithSlicePass()(gm)
+        self.assertFalse(result.modified)
+        with self.assertRaises(ValueError):
+            _compute_slice_byte_offset(
+                next(n for n in gm.graph.nodes if n.op == "placeholder").meta["spec"],
+                0,
+                -2,
+            )
+
+    def test_lowered_program_matches_eager_output(self) -> None:
+        """The emitted sub-buffer alias executes with the original semantics."""
+
+        class M(torch.nn.Module):
+            def forward(self, x):
+                return x[1:3] + 1.0
+
+        model = M().eval()
+        example_input = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        et = to_edge(export(model, (example_input,), strict=True)).to_executorch()
+        runtime_module = _load_for_executorch_from_buffer(et.buffer)
+
+        assert_close(runtime_module.forward((example_input,))[0], model(example_input))
 
     def test_non_slice_nodes_are_ignored(self) -> None:
         class M(torch.nn.Module):
