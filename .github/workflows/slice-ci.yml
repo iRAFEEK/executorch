@@ -1,0 +1,51 @@
+name: Slice optimization prototype
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/slice-ci]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch cmake ninja
+
+      - name: Build local ExecuTorch source
+        run: python -m pip install -e . --no-deps --no-build-isolation
+
+      - name: Run slice-pass unit tests
+        run: python exir/tests/test_replace_slice_copy_with_slice_pass.py -v
+
+      - name: Verify contiguous slice lowering
+        run: |
+          python - <<'PY'
+          import torch
+          from torch.export import export
+          from executorch.exir import to_edge
+
+          class SliceModel(torch.nn.Module):
+              def forward(self, x):
+                  return x[0:2] + 1.0
+
+          et = to_edge(
+              export(SliceModel().eval(), (torch.randn(4, 8),))
+          ).to_executorch()
+          operators = [
+              f"{op.name}::{op.overload}"
+              for op in et.executorch_program.execution_plan[0].operators
+          ]
+          print("Emitted operators:", operators)
+          assert not any("slice_copy" in op for op in operators), operators
+          PY

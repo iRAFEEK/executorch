@@ -73,6 +73,9 @@ from executorch.exir.passes.replace_aten_with_edge_pass import aten_to_edge
 from executorch.exir.passes.replace_view_copy_with_view_pass import (
     ReplaceViewCopyWithViewPass,
 )
+from executorch.exir.passes.replace_slice_copy_with_slice_pass import (
+    ReplaceSliceCopyWithSlicePass,
+)
 from executorch.exir.passes.spec_prop_pass import SpecPropPass
 from executorch.exir.passes.weights_to_outputs_pass import weights_to_outputs_pass
 from executorch.exir.print_program import pretty_print, print_program
@@ -748,6 +751,7 @@ def pre_memory_planning_passes(
             NormalizeViewCopyBasePass(),
             dead_code_elimination_pass,
             ReplaceViewCopyWithViewPass(),
+            ReplaceSliceCopyWithSlicePass(),
             sym_shape_eval_pass,
             config.to_out_var_pass,
         ]
