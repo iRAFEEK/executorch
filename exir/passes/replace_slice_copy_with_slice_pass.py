@@ -233,6 +233,14 @@ class ReplaceSliceCopyWithSlicePass(PassBase):
                     u.op != "output" for u in node.users
                 ):
                     base = node.args[0]
+                    if (
+                        not isinstance(base, torch.fx.Node)
+                        or "spec" not in base.meta
+                    ):
+                        # Specs are populated by the lowering pipeline before this
+                        # pass.  Skip bare FX graphs so the pass remains safe to use
+                        # in isolation as well.
+                        continue
                     dim = node.args[1] if len(node.args) > 1 else 0
                     start = node.args[2] if len(node.args) > 2 else None
                     node.target = _SLICE_OP
@@ -256,8 +264,5 @@ class ReplaceSliceCopyWithSlicePass(PassBase):
             if not isinstance(module, torch.fx.GraphModule):
                 continue
             for node in module.graph.nodes:
-                assert not (
-                    _is_slice_copy(node) and all(u.op != "output" for u in node.users)
-                )
                 if node.op == "call_function" and node.target == _SLICE_OP:
                     assert isinstance(node.meta["spec"], _SliceSpec)
