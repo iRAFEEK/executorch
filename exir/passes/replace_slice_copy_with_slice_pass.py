@@ -236,6 +236,7 @@ class ReplaceSliceCopyWithSlicePass(PassBase):
                     if (
                         not isinstance(base, torch.fx.Node)
                         or "spec" not in base.meta
+                        or not base.meta["spec"].is_static_shape_tensor
                     ):
                         # Specs are populated by the lowering pipeline before this
                         # pass.  Skip bare FX graphs so the pass remains safe to use
